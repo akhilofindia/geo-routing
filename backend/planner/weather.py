@@ -1,8 +1,14 @@
-"""Open-Meteo hourly forecasts, keyed by rounded coordinates."""
+"""Hourly forecasts for the corridor.
+
+US points come from the National Weather Service. The public Open-Meteo
+forecast is only a fallback, because cloud hosts share its daily limit.
+"""
 
 from __future__ import annotations
 
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -10,7 +16,11 @@ import requests
 from planner.geometry import haversine_miles
 
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
-USER_AGENT = "truck-route-planner/1.0"
+NWS_POINTS_URL = "https://api.weather.gov/points"
+USER_AGENT = "truck-route-planner/1.0 (https://github.com/akhilofindia/geo-routing)"
+NWS_HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/geo+json"}
+_CACHE: dict[str, tuple[float, Hourly]] = {}
+_CACHE_SECONDS = 60 * 60
 CHUNK_SIZE = 25
 # One location counts as one lookup. A cross-country trip must stay well under
 # the free service's 600 lookups per minute.
@@ -99,11 +109,141 @@ def fetch_forecasts(points: list[tuple[float, float]], forecast_days: int) -> di
     unique = list(dict.fromkeys(points))
     if not unique:
         return {}
+    found = _fetch_nws(unique)
+    if len(found) >= max(1, len(unique) // 4):
+        return found
     days = max(1, min(16, int(forecast_days)))
-    merged: dict[tuple[float, float], Hourly] = {}
-    for start in range(0, len(unique), CHUNK_SIZE):
-        merged.update(_fetch_chunk(unique[start : start + CHUNK_SIZE], days))
-    return merged
+    try:
+        fallback = {}
+        for start in range(0, len(unique), CHUNK_SIZE):
+            fallback.update(_fetch_chunk(unique[start : start + CHUNK_SIZE], days))
+    except WeatherError:
+        if found:
+            return found
+        raise
+    found.update(fallback)
+    return found
+
+
+def duration_hours(spec: str) -> int:
+    """Hours covered by an NWS validTime duration such as PT3H or P1DT6H."""
+    days = int(re.search(r"(\d+)D", spec).group(1)) if re.search(r"(\d+)D", spec) else 0
+    hours = int(re.search(r"(\d+)H", spec).group(1)) if re.search(r"(\d+)H", spec) else 0
+    minutes = int(re.search(r"(\d+)M", spec).group(1)) if re.search(r"(\d+)M", spec) else 0
+    return max(1, days * 24 + hours + (1 if minutes >= 30 else 0))
+
+
+def nws_series(block: dict, kind: str) -> dict[datetime, float]:
+    """Map an NWS grid series onto UTC hours. Wind is mph. Rain and snow are inches per hour."""
+    uom = str(block.get("uom") or "")
+    series: dict[datetime, float] = {}
+    for item in block.get("values") or []:
+        stamp, _, duration = str(item.get("validTime") or "").partition("/")
+        value = _number(item.get("value"))
+        if not stamp or value is None:
+            continue
+        start = datetime.fromisoformat(stamp).astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        span = duration_hours(duration or "PT1H")
+        amount = _nws_amount(value, uom, kind, span)
+        for offset in range(min(span, 24 * 8)):
+            series[start + timedelta(hours=offset)] = amount
+    return series
+
+
+def hourly_from_nws(wind: dict[datetime, float], rain: dict[datetime, float], snow: dict[datetime, float]) -> Hourly | None:
+    if not wind:
+        return None
+    start = min(wind)
+    end = max(wind)
+    times: list[datetime] = []
+    winds: list[float] = []
+    rains: list[float] = []
+    snows: list[float] = []
+    hour = start
+    while hour <= end and len(times) < 24 * 8:
+        times.append(hour)
+        winds.append(wind.get(hour, 0.0))
+        rains.append(rain.get(hour, 0.0))
+        snows.append(snow.get(hour, 0.0))
+        hour += timedelta(hours=1)
+    return Hourly(times, winds, rains, snows)
+
+
+def _nws_amount(value: float, uom: str, kind: str, span: int) -> float:
+    if kind == "wind":
+        if "km_h" in uom:
+            return value * 0.621371
+        if "m_s" in uom:
+            return value * 2.23694
+        return value
+    per_hour = value / span
+    if "mm" in uom:
+        return per_hour / 25.4
+    return per_hour
+
+
+def _fetch_nws(points: list[tuple[float, float]]) -> dict[tuple[float, float], Hourly]:
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        located = list(pool.map(_nws_grid_url, points))
+    groups: dict[str, list[tuple[float, float]]] = {}
+    for point, url in zip(points, located):
+        if url:
+            groups.setdefault(url, []).append(point)
+    if not groups:
+        return {}
+    parsed: dict[tuple[float, float], Hourly] = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        loaded = pool.map(_cached_grid, list(groups))
+        for url, hourly in zip(groups, loaded):
+            if hourly is None:
+                continue
+            for point in groups[url]:
+                parsed[point] = hourly
+    return parsed
+
+
+def _nws_grid_url(point: tuple[float, float]) -> str | None:
+    lat, lon = point
+    try:
+        response = requests.get(
+            f"{NWS_POINTS_URL}/{lat:.4f},{lon:.4f}",
+            headers=NWS_HEADERS,
+            timeout=20,
+        )
+    except requests.RequestException:
+        return None
+    if response.status_code != 200:
+        return None
+    try:
+        url = response.json()["properties"]["forecastGridData"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return str(url) if url else None
+
+
+def _cached_grid(url: str) -> Hourly | None:
+    cached = _CACHE.get(url)
+    now = time.monotonic()
+    if cached and now - cached[0] < _CACHE_SECONDS:
+        return cached[1]
+    try:
+        response = requests.get(url, headers=NWS_HEADERS, timeout=30)
+    except requests.RequestException:
+        return None
+    if response.status_code != 200:
+        return None
+    try:
+        props = response.json()["properties"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    hourly = hourly_from_nws(
+        nws_series(props.get("windSpeed") or {}, "wind"),
+        nws_series(props.get("quantitativePrecipitation") or {}, "precip"),
+        nws_series(props.get("snowfallAmount") or {}, "precip"),
+    )
+    if hourly is not None:
+        _CACHE[url] = (now, hourly)
+    return hourly
 
 
 def forecast_hours(now: datetime | None = None) -> list[datetime]:

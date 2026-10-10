@@ -1,5 +1,7 @@
 from planner.routing import RoutingError, describe_osrm_failure, describe_valhalla_failure, prefer_routing_error
-from planner.weather import describe_weather_reason, limit_locations
+from datetime import datetime, timedelta, timezone
+
+from planner.weather import describe_weather_reason, limit_locations, nws_series
 from planner.planning import PlanError, plan_trip
 
 
@@ -49,6 +51,21 @@ def test_weather_reasons_stay_specific():
     assert "per minute" in describe_weather_reason("Minutely API request limit exceeded")
     assert "tomorrow" in describe_weather_reason("Daily API request limit exceeded")
     assert "outside the area" in describe_weather_reason("Parameter latitude is invalid")
+
+
+def test_nws_wind_and_rain_units():
+    hour = datetime(2026, 10, 10, 5, tzinfo=timezone.utc)
+    wind = nws_series(
+        {"uom": "wmoUnit:km_h-1", "values": [{"validTime": "2026-10-10T05:00:00+00:00/PT2H", "value": 10}]},
+        "wind",
+    )
+    rain = nws_series(
+        {"uom": "wmoUnit:mm", "values": [{"validTime": "2026-10-10T05:00:00+00:00/PT3H", "value": 25.4}]},
+        "precip",
+    )
+    assert abs(wind[hour] - 6.21371) < 0.01
+    assert hour + timedelta(hours=1) in wind
+    assert abs(rain[hour] - (1 / 3)) < 0.01
 
 
 def test_long_corridor_stays_within_the_lookup_budget():
