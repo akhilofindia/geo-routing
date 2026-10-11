@@ -119,9 +119,15 @@ def fetch_forecasts(points: list[tuple[float, float]], forecast_days: int) -> di
     if _nws_grid_url(unique[len(unique) // 2], timeout=5):
         found = _fetch_nws(unique)
     missing = [point for point in unique if point not in found]
+    met_points: list[tuple[float, float]] = []
     if missing:
-        found.update(_fetch_met(_spread(missing, MET_BUDGET)))
-    if len(found) >= max(1, len(unique) // 4):
+        met_points = _spread(missing, MET_BUDGET)
+        found.update(_fetch_met(met_points))
+    # Worldwide forecasts are a coarse grid. Covering that grid is enough; the
+    # other samples reuse the nearest forecast. Falling through to another
+    # service here is what makes the host drop the plan.
+    needed = max(1, len(met_points) // 4) if met_points else max(1, len(unique) // 4)
+    if len(found) >= needed:
         return found
     days = max(1, min(16, int(forecast_days)))
     try:

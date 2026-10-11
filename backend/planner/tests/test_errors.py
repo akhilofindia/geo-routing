@@ -91,8 +91,12 @@ def test_places_outside_the_us_do_not_wait_on_the_us_weather_service(monkeypatch
         hourly = Hourly([hour], [5.0], [0.0], [0.0])
         return {point: hourly for point in points}
 
+    def fail_fallback(points, forecast_days):
+        raise AssertionError("worldwide forecasts should not fall through to another service")
+
     monkeypatch.setattr("planner.weather._nws_grid_url", grid)
     monkeypatch.setattr("planner.weather._fetch_met", met)
+    monkeypatch.setattr("planner.weather._fetch_chunk", fail_fallback)
     points = [(25.6 + index * 0.05, 85.1 - index * 0.08) for index in range(80)]
     found = fetch_forecasts(points, 3)
     assert calls == [points[40]]
