@@ -92,41 +92,60 @@ def _valhalla_set(
     destination: tuple[float, float],
     load_lb: float,
 ) -> list[dict]:
-    primary = _valhalla(origin, destination, load_lb, alternates=2, use_tolls=1, use_highways=1)
-    routes = [
-        _describe(trip, "Fastest truck route" if index == 0 else "Alternate truck route")
-        for index, trip in enumerate(primary)
-    ]
-    if _count_unique(routes) < 3:
-        for trip in _extra_routes(origin, destination, load_lb, use_tolls=0, use_highways=1):
-            routes.append(_describe(trip, "Avoids tolls"))
-    if _count_unique(routes) < 3:
-        for trip in _extra_routes(origin, destination, load_lb, use_tolls=1, use_highways=0.15):
-            routes.append(_describe(trip, "Fewer highways"))
-    if _count_unique(routes) < 3 and routes:
-        for trip in _via_routes(origin, destination, load_lb, routes[0]["points"]):
-            routes.append(_describe(trip, "Offset alternate"))
-    return routes
+    """Ask for the route variants at the same time. A slow one must not block the others."""
+    specs = (
+        ("primary", 2, 1, 1.0),
+        ("tolls", 0, 0, 1.0),
+        ("highways", 0, 1, 0.15),
+    )
+    errors: list[RoutingError] = []
+    collected: list[tuple[str, list[dict]]] = []
 
-
-def _extra_routes(
-    origin: tuple[float, float],
-    destination: tuple[float, float],
-    load_lb: float,
-    use_tolls: float,
-    use_highways: float,
-) -> list[dict]:
-    try:
-        return _valhalla(
+    def run(kind: str, alternates: int, use_tolls: float, use_highways: float):
+        trips = _valhalla(
             origin,
             destination,
             load_lb,
-            alternates=0,
+            alternates=alternates,
             use_tolls=use_tolls,
             use_highways=use_highways,
         )
-    except RoutingError:
-        return []
+        return kind, trips
+
+    with ThreadPoolExecutor(max_workers=len(specs)) as pool:
+        futures = [pool.submit(run, *spec) for spec in specs]
+        for future in futures:
+            try:
+                collected.append(future.result())
+            except RoutingError as exc:
+                errors.append(exc)
+
+    routes: list[dict] = []
+    for kind, trips in collected:
+        for index, trip in enumerate(trips):
+            if kind == "primary":
+                subtitle = "Fastest truck route" if index == 0 else "Alternate truck route"
+            elif kind == "tolls":
+                subtitle = "Avoids tolls"
+            else:
+                subtitle = "Fewer highways"
+            try:
+                routes.append(_describe(trip, subtitle))
+            except RoutingError as exc:
+                errors.append(exc)
+    if _count_unique(routes) < 3 and routes:
+        for trip in _via_routes(origin, destination, load_lb, routes[0]["points"]):
+            try:
+                routes.append(_describe(trip, "Offset alternate"))
+            except RoutingError:
+                break
+    if routes:
+        return routes
+    if any(exc.code == "distance" for exc in errors):
+        raise next(exc for exc in errors if exc.code == "distance")
+    if errors:
+        raise errors[0]
+    raise RoutingError("No drivable road connects those places.", status=400, code="no_route")
 
 
 def _count_unique(routes: list[dict]) -> int:
@@ -502,7 +521,7 @@ def _add_offset_routes(
     routes: list[dict],
 ) -> None:
     """Add a corridor through a point the routes found so far do not use."""
-    for via in via_candidates(routes):
+    for via in via_candidates(routes)[:1]:
         if _count_unique(routes) >= 3:
             return
         try:
@@ -545,7 +564,7 @@ def _osrm_routes(
                 "steps": "false",
             },
             headers={"User-Agent": USER_AGENT},
-            timeout=25,
+            timeout=8,
         )
         payload = response.json()
     except requests.Timeout as exc:
@@ -607,64 +626,59 @@ def _osrm_times(route: dict, count: int, duration: float) -> list[float]:
 
 
 def _post_json(url: str, body: dict) -> dict:
-    last_error: Exception | None = None
-    for _attempt in range(2):
-        try:
-            response = requests.post(
-                url,
-                json=body,
-                headers={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
-                timeout=25,
-            )
-        except requests.Timeout as exc:
-            last_error = RoutingError(
-                "The truck router timed out. Try again in a moment.",
-                status=504,
-                code="timeout",
-            )
-            last_error.__cause__ = exc
-            continue
-        except requests.RequestException as exc:
-            raise RoutingError(
-                "The truck router did not respond. Try again in a moment.",
-                status=502,
-                code="down",
-            ) from exc
-        if response.status_code == 429:
-            raise RoutingError("The truck router is busy. Try again in a moment.", status=503, code="busy")
+    """One attempt. A retry is what holds the only server worker until the host gives up."""
+    try:
+        response = requests.post(
+            url,
+            json=body,
+            headers={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
+            timeout=8,
+        )
+    except requests.Timeout as exc:
+        raise RoutingError(
+            "The truck router timed out. Try again in a moment.",
+            status=504,
+            code="timeout",
+        ) from exc
+    except requests.RequestException as exc:
+        raise RoutingError(
+            "The truck router did not respond. Try again in a moment.",
+            status=502,
+            code="down",
+        ) from exc
+    if response.status_code == 429:
+        raise RoutingError("The truck router is busy. Try again in a moment.", status=503, code="busy")
+    try:
+        payload = response.json()
+    except ValueError as exc:
         if response.status_code >= 500:
-            last_error = RoutingError(
+            raise RoutingError(
                 "The truck router is unavailable. Try again in a moment.",
                 status=502,
                 code="down",
-            )
-            continue
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise RoutingError(
-                "The truck router returned an unreadable response.",
-                status=502,
-                code="unreadable",
             ) from exc
-        if response.status_code >= 400:
-            message = payload.get("error") if isinstance(payload, dict) else ""
-            error_code = payload.get("error_code") if isinstance(payload, dict) else None
-            raise describe_valhalla_failure(
-                str(message or ""),
-                error_code if isinstance(error_code, int) else None,
-                response.status_code,
-            )
-        if not isinstance(payload, dict):
-            raise RoutingError(
-                "The truck router returned an unreadable response.",
-                status=502,
-                code="unreadable",
-            )
-        return payload
-    if isinstance(last_error, RoutingError):
-        raise last_error
-    raise RoutingError("The truck router did not respond. Try again in a moment.", status=502, code="down")
+        raise RoutingError(
+            "The truck router returned an unreadable response.",
+            status=502,
+            code="unreadable",
+        ) from exc
+    if response.status_code >= 500:
+        raise RoutingError("The truck router is unavailable. Try again in a moment.", status=502, code="down")
+    if response.status_code >= 400:
+        message = payload.get("error") if isinstance(payload, dict) else ""
+        error_code = payload.get("error_code") if isinstance(payload, dict) else None
+        raise describe_valhalla_failure(
+            str(message or ""),
+            error_code if isinstance(error_code, int) else None,
+            response.status_code,
+        )
+    if not isinstance(payload, dict):
+        raise RoutingError(
+            "The truck router returned an unreadable response.",
+            status=502,
+            code="unreadable",
+        )
+    return payload
 
 
 def _signature(points: list[tuple[float, float]]) -> set[tuple[float, float]]:

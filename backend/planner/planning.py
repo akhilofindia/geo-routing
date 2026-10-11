@@ -64,7 +64,8 @@ def plan_trip(payload: dict) -> dict:
     try:
         forecasts = fetch_forecasts(keys, forecast_days)
     except WeatherError as exc:
-        raise PlanError(str(exc), status=exc.status) from exc
+        forecasts = {}
+        warnings.append(str(exc))
 
     outside_forecast = False
     built = []

@@ -1,4 +1,13 @@
-from planner.routing import RoutingError, describe_osrm_failure, describe_valhalla_failure, prefer_routing_error
+import pytest
+import requests
+
+from planner.routing import (
+    RoutingError,
+    _post_json,
+    describe_osrm_failure,
+    describe_valhalla_failure,
+    prefer_routing_error,
+)
 from datetime import datetime, timedelta, timezone
 
 from planner.weather import (
@@ -99,9 +108,23 @@ def test_places_outside_the_us_do_not_wait_on_the_us_weather_service(monkeypatch
     monkeypatch.setattr("planner.weather._fetch_chunk", fail_fallback)
     points = [(25.6 + index * 0.05, 85.1 - index * 0.08) for index in range(80)]
     found = fetch_forecasts(points, 3)
-    assert calls == [points[40]]
-    assert received["count"] <= 36
+    assert len(calls) == 1
+    assert received["count"] <= 20
     assert len(found) == received["count"]
+
+
+def test_truck_router_is_asked_once_when_it_times_out(monkeypatch):
+    calls = {"n": 0}
+
+    def post(*_args, **_kwargs):
+        calls["n"] += 1
+        raise requests.Timeout()
+
+    monkeypatch.setattr("planner.routing.requests.post", post)
+    with pytest.raises(RoutingError) as caught:
+        _post_json("https://example.test/route", {})
+    assert calls["n"] == 1
+    assert caught.value.code == "timeout"
 
 
 def test_met_hour_converts_wind_and_splits_snow():

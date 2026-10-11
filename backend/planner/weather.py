@@ -28,7 +28,7 @@ CHUNK_SIZE = 25
 LOOKUP_BUDGET = 80
 # Each worldwide forecast is its own request. Keep the set small enough to
 # finish before the host cuts off a long plan.
-MET_BUDGET = 36
+MET_BUDGET = 20
 
 
 class WeatherError(Exception):
@@ -110,36 +110,20 @@ def forecast_for(
 
 
 def fetch_forecasts(points: list[tuple[float, float]], forecast_days: int) -> dict[tuple[float, float], Hourly]:
-    unique = list(dict.fromkeys(points))
+    unique = _spread(list(dict.fromkeys(points)), MET_BUDGET)
     if not unique:
         return {}
     found: dict[tuple[float, float], Hourly] = {}
     # One probe. A corridor outside the United States would otherwise wait on a
     # failed US lookup for every sample, long enough for the host to drop the plan.
-    if _nws_grid_url(unique[len(unique) // 2], timeout=5):
+    if _nws_grid_url(unique[len(unique) // 2], timeout=4):
         found = _fetch_nws(unique)
     missing = [point for point in unique if point not in found]
-    met_points: list[tuple[float, float]] = []
     if missing:
-        met_points = _spread(missing, MET_BUDGET)
-        found.update(_fetch_met(met_points))
-    # Worldwide forecasts are a coarse grid. Covering that grid is enough; the
-    # other samples reuse the nearest forecast. Falling through to another
-    # service here is what makes the host drop the plan.
-    needed = max(1, len(met_points) // 4) if met_points else max(1, len(unique) // 4)
-    if len(found) >= needed:
+        found.update(_fetch_met(missing))
+    if found:
         return found
-    days = max(1, min(16, int(forecast_days)))
-    try:
-        fallback = {}
-        for start in range(0, len(unique), CHUNK_SIZE):
-            fallback.update(_fetch_chunk(unique[start : start + CHUNK_SIZE], days))
-    except WeatherError:
-        if found:
-            return found
-        raise
-    found.update(fallback)
-    return found
+    raise WeatherError("The weather service did not respond. Try again in a moment.", status=502)
 
 
 def duration_hours(spec: str) -> int:
@@ -200,7 +184,7 @@ def _nws_amount(value: float, uom: str, kind: str, span: int) -> float:
 
 
 def _fetch_nws(points: list[tuple[float, float]]) -> dict[tuple[float, float], Hourly]:
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=8) as pool:
         located = list(pool.map(_nws_grid_url, points))
     groups: dict[str, list[tuple[float, float]]] = {}
     for point, url in zip(points, located):
@@ -249,7 +233,7 @@ def _cached_met(point: tuple[float, float]) -> Hourly | None:
             MET_URL,
             params={"lat": f"{lat:.4f}", "lon": f"{lon:.4f}"},
             headers={"User-Agent": USER_AGENT},
-            timeout=8,
+            timeout=6,
         )
     except requests.RequestException:
         return None

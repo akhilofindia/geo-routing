@@ -18,4 +18,4 @@ COPY backend ./backend
 COPY --from=frontend /src/dist ./frontend/dist
 WORKDIR /app/backend
 EXPOSE 8000
-CMD ["sh", "-c", "gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --timeout 120 --workers 1"]
+CMD ["sh", "-c", "gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --worker-class gthread --workers 1 --threads 2 --timeout 40 --graceful-timeout 5"]
