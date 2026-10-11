@@ -1,7 +1,7 @@
 from planner.routing import RoutingError, describe_osrm_failure, describe_valhalla_failure, prefer_routing_error
 from datetime import datetime, timedelta, timezone
 
-from planner.weather import describe_weather_reason, limit_locations, nws_series
+from planner.weather import describe_weather_reason, limit_locations, met_entry, nws_series, split_precipitation
 from planner.planning import PlanError, plan_trip
 
 
@@ -66,6 +66,25 @@ def test_nws_wind_and_rain_units():
     assert abs(wind[hour] - 6.21371) < 0.01
     assert hour + timedelta(hours=1) in wind
     assert abs(rain[hour] - (1 / 3)) < 0.01
+
+
+def test_met_hour_converts_wind_and_splits_snow():
+    entry = {
+        "time": "2026-10-11T12:00:00Z",
+        "data": {
+            "instant": {"details": {"air_temperature": -2.0, "wind_speed": 10.0}},
+            "next_1_hours": {
+                "summary": {"symbol_code": "snow"},
+                "details": {"precipitation_amount": 2.54},
+            },
+        },
+    }
+    moment, wind, rain, snow = met_entry(entry)
+    assert moment == datetime(2026, 10, 11, 12, tzinfo=timezone.utc)
+    assert abs(wind - 22.3694) < 0.01
+    assert rain == 0
+    assert abs(snow - 1.0) < 0.01
+    assert split_precipitation(2.54, "rain", 20) == (0.1, 0.0)
 
 
 def test_long_corridor_stays_within_the_lookup_budget():

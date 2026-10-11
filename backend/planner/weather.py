@@ -17,6 +17,7 @@ from planner.geometry import haversine_miles
 
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 NWS_POINTS_URL = "https://api.weather.gov/points"
+MET_URL = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
 USER_AGENT = "truck-route-planner/1.0 (https://github.com/akhilofindia/geo-routing)"
 NWS_HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/geo+json"}
 _CACHE: dict[str, tuple[float, Hourly]] = {}
@@ -110,6 +111,9 @@ def fetch_forecasts(points: list[tuple[float, float]], forecast_days: int) -> di
     if not unique:
         return {}
     found = _fetch_nws(unique)
+    missing = [point for point in unique if point not in found]
+    if missing:
+        found.update(_fetch_met(missing))
     if len(found) >= max(1, len(unique) // 4):
         return found
     days = max(1, min(16, int(forecast_days)))
@@ -200,6 +204,95 @@ def _fetch_nws(points: list[tuple[float, float]]) -> dict[tuple[float, float], H
             for point in groups[url]:
                 parsed[point] = hourly
     return parsed
+
+
+def _fetch_met(points: list[tuple[float, float]]) -> dict[tuple[float, float], Hourly]:
+    """Worldwide forecast for places the US weather service does not cover."""
+    parsed: dict[tuple[float, float], Hourly] = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for point, hourly in zip(points, pool.map(_cached_met, points)):
+            if hourly is not None:
+                parsed[point] = hourly
+    return parsed
+
+
+def _cached_met(point: tuple[float, float]) -> Hourly | None:
+    lat, lon = point
+    key = f"met:{lat:.2f},{lon:.2f}"
+    cached = _CACHE.get(key)
+    now = time.monotonic()
+    if cached and now - cached[0] < _CACHE_SECONDS:
+        return cached[1]
+    try:
+        response = requests.get(
+            MET_URL,
+            params={"lat": f"{lat:.4f}", "lon": f"{lon:.4f}"},
+            headers={"User-Agent": USER_AGENT},
+            timeout=20,
+        )
+    except requests.RequestException:
+        return None
+    if response.status_code != 200:
+        return None
+    try:
+        series = response.json()["properties"]["timeseries"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    hourly = hourly_from_met(series)
+    if hourly is not None:
+        _CACHE[key] = (now, hourly)
+    return hourly
+
+
+def hourly_from_met(series: list) -> Hourly | None:
+    times: list[datetime] = []
+    winds: list[float] = []
+    rains: list[float] = []
+    snows: list[float] = []
+    for entry in series:
+        parsed = met_entry(entry)
+        if parsed is None:
+            continue
+        moment, wind, rain, snow = parsed
+        times.append(moment)
+        winds.append(wind)
+        rains.append(rain)
+        snows.append(snow)
+        if len(times) >= 24 * 8:
+            break
+    if not times:
+        return None
+    return Hourly(times, winds, rains, snows)
+
+
+def met_entry(entry: dict) -> tuple[datetime, float, float, float] | None:
+    """One forecast hour: wind mph, rain inches, snow inches."""
+    stamp = entry.get("time")
+    data = entry.get("data") or {}
+    instant = ((data.get("instant") or {}).get("details") or {})
+    wind = _number(instant.get("wind_speed"))
+    if not stamp or wind is None:
+        return None
+    moment = datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).astimezone(timezone.utc).replace(
+        minute=0, second=0, microsecond=0
+    )
+    period = (data.get("next_1_hours") or data.get("next_6_hours") or {})
+    details = period.get("details") or {}
+    amount = _number(details.get("precipitation_amount")) or 0.0
+    if "next_1_hours" not in data and "next_6_hours" in data:
+        amount = amount / 6
+    symbol = str((period.get("summary") or {}).get("symbol_code") or "")
+    temperature = _number(instant.get("air_temperature"))
+    rain, snow = split_precipitation(amount, symbol, temperature)
+    return moment, wind * 2.23694, rain, snow
+
+
+def split_precipitation(millimeters: float, symbol: str, temperature: float | None) -> tuple[float, float]:
+    inches = millimeters / 25.4
+    frozen = "snow" in symbol.lower() or "sleet" in symbol.lower() or (temperature is not None and temperature <= 0)
+    if frozen:
+        return 0.0, inches * 10
+    return inches, 0.0
 
 
 def _nws_grid_url(point: tuple[float, float]) -> str | None:
