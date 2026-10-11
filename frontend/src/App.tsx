@@ -178,7 +178,7 @@ export function App() {
         </div>
         {!result && !loading && (
           <div className="empty">
-            <p>Three truck routes, scored by the weather the truck will actually meet.</p>
+            <p>Compare up to three truck routes by the wind, rain, and snow along the way.</p>
           </div>
         )}
         {loading && <div className="pending">Sampling the forecast along each route…</div>}
