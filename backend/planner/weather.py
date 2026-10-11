@@ -26,6 +26,9 @@ CHUNK_SIZE = 25
 # One location counts as one lookup. A cross-country trip must stay well under
 # the free service's 600 lookups per minute.
 LOOKUP_BUDGET = 80
+# Each worldwide forecast is its own request. Keep the set small enough to
+# finish before the host cuts off a long plan.
+MET_BUDGET = 36
 
 
 class WeatherError(Exception):
@@ -110,10 +113,14 @@ def fetch_forecasts(points: list[tuple[float, float]], forecast_days: int) -> di
     unique = list(dict.fromkeys(points))
     if not unique:
         return {}
-    found = _fetch_nws(unique)
+    found: dict[tuple[float, float], Hourly] = {}
+    # One probe. A corridor outside the United States would otherwise wait on a
+    # failed US lookup for every sample, long enough for the host to drop the plan.
+    if _nws_grid_url(unique[len(unique) // 2], timeout=5):
+        found = _fetch_nws(unique)
     missing = [point for point in unique if point not in found]
     if missing:
-        found.update(_fetch_met(missing))
+        found.update(_fetch_met(_spread(missing, MET_BUDGET)))
     if len(found) >= max(1, len(unique) // 4):
         return found
     days = max(1, min(16, int(forecast_days)))
@@ -206,10 +213,18 @@ def _fetch_nws(points: list[tuple[float, float]]) -> dict[tuple[float, float], H
     return parsed
 
 
+def _spread(points: list[tuple[float, float]], budget: int) -> list[tuple[float, float]]:
+    if len(points) <= budget:
+        return points
+    step = len(points) / budget
+    chosen = [points[min(len(points) - 1, int(index * step))] for index in range(budget)]
+    return list(dict.fromkeys(chosen))
+
+
 def _fetch_met(points: list[tuple[float, float]]) -> dict[tuple[float, float], Hourly]:
     """Worldwide forecast for places the US weather service does not cover."""
     parsed: dict[tuple[float, float], Hourly] = {}
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=8) as pool:
         for point, hourly in zip(points, pool.map(_cached_met, points)):
             if hourly is not None:
                 parsed[point] = hourly
@@ -228,7 +243,7 @@ def _cached_met(point: tuple[float, float]) -> Hourly | None:
             MET_URL,
             params={"lat": f"{lat:.4f}", "lon": f"{lon:.4f}"},
             headers={"User-Agent": USER_AGENT},
-            timeout=20,
+            timeout=8,
         )
     except requests.RequestException:
         return None
@@ -295,13 +310,13 @@ def split_precipitation(millimeters: float, symbol: str, temperature: float | No
     return inches, 0.0
 
 
-def _nws_grid_url(point: tuple[float, float]) -> str | None:
+def _nws_grid_url(point: tuple[float, float], timeout: int = 8) -> str | None:
     lat, lon = point
     try:
         response = requests.get(
             f"{NWS_POINTS_URL}/{lat:.4f},{lon:.4f}",
             headers=NWS_HEADERS,
-            timeout=20,
+            timeout=timeout,
         )
     except requests.RequestException:
         return None

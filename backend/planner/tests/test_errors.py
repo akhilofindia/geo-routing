@@ -1,7 +1,15 @@
 from planner.routing import RoutingError, describe_osrm_failure, describe_valhalla_failure, prefer_routing_error
 from datetime import datetime, timedelta, timezone
 
-from planner.weather import describe_weather_reason, limit_locations, met_entry, nws_series, split_precipitation
+from planner.weather import (
+    Hourly,
+    describe_weather_reason,
+    fetch_forecasts,
+    limit_locations,
+    met_entry,
+    nws_series,
+    split_precipitation,
+)
 from planner.planning import PlanError, plan_trip
 
 
@@ -66,6 +74,30 @@ def test_nws_wind_and_rain_units():
     assert abs(wind[hour] - 6.21371) < 0.01
     assert hour + timedelta(hours=1) in wind
     assert abs(rain[hour] - (1 / 3)) < 0.01
+
+
+def test_places_outside_the_us_do_not_wait_on_the_us_weather_service(monkeypatch):
+    calls = []
+
+    def grid(point, timeout=8):
+        calls.append(point)
+        return None
+
+    received = {}
+
+    def met(points):
+        received["count"] = len(points)
+        hour = datetime(2026, 10, 11, 12, tzinfo=timezone.utc)
+        hourly = Hourly([hour], [5.0], [0.0], [0.0])
+        return {point: hourly for point in points}
+
+    monkeypatch.setattr("planner.weather._nws_grid_url", grid)
+    monkeypatch.setattr("planner.weather._fetch_met", met)
+    points = [(25.6 + index * 0.05, 85.1 - index * 0.08) for index in range(80)]
+    found = fetch_forecasts(points, 3)
+    assert calls == [points[40]]
+    assert received["count"] <= 36
+    assert len(found) == received["count"]
 
 
 def test_met_hour_converts_wind_and_splits_snow():

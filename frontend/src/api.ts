@@ -19,6 +19,9 @@ export async function planTrip(body: PlanRequest): Promise<PlanResponse> {
   try {
     data = await response.json();
   } catch {
+    if (response.status === 502 || response.status === 504) {
+      throw new Error("The planner took too long and the host stopped the request. Try again.");
+    }
     throw new Error("The planner returned an unreadable response.");
   }
   if (!response.ok) {
